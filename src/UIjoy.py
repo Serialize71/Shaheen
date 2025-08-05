@@ -12,19 +12,6 @@ CTRL_LOOP_TIME = 1 / 100
 SLOW_MSGS_LOOP_TIME = 1 / 5
 NO_OF_CYCLES_AVERAGE_GUI_TIME = 10
 
-alt_hold = False
-alt_setpoint = 0
-alt = 0
-eh = 0
-Kp = 55
-Ki = 15
-ei = 0
-last_alt_toggle_time = 0
-HOVER_THROTTLE = 1600  # Tune this!
-DEBOUNCE_TIME = 0.5
-ALT_FILTER_ALPHA = 0.1
-filtered_alt = 0
-
 pygame.init()
 pygame.event.set_blocked((MOUSEMOTION, MOUSEBUTTONUP, MOUSEBUTTONDOWN))
 pygame.joystick.init()
@@ -35,16 +22,22 @@ joy.init()
 
 axis = []
 button = []
+throttle_trim = 0
 
 
 def update():
-    global axis, button
+    global axis, button, joy
+
     pygame.event.pump()
+    if pygame.joystick.get_count() == 0:
+        raise RuntimeError("Joystick disconnected!")
+
     try:
+        joy = pygame.joystick.Joystick(0)
         axis = [joy.get_axis(i) for i in range(joy.get_numaxes())]
         button = [joy.get_button(i) for i in range(joy.get_numbuttons())]
-    except pygame.error:
-        pass
+    except pygame.error as err:
+        raise RuntimeError("Joystick error during update!") from err
 
 
 def detect_serial_port():
@@ -66,7 +59,7 @@ def run_curses(external_function):
         curses.cbreak()
         screen.timeout(0)
         screen.keypad(True)
-        screen.addstr(1, 0, "Joystick mode: 'A' to arm, 'B' to disarm, 'X' to switch mode, hold R2 to reboot, 'Y' for failsafe, 'LB' alt hold", curses.A_BOLD)
+        screen.addstr(1, 0, "Joystick mode: 'A' to arm, 'B' to disarm, 'X' to switch mode, hold R2 to reboot, 'Y' for failsafe", curses.A_BOLD)
         result = external_function(screen)
     finally:
         curses.nocbreak()
@@ -78,7 +71,7 @@ def run_curses(external_function):
 
 
 def joy_controller(screen):
-    global alt_hold, alt_setpoint, alt, eh, last_alt_toggle_time, filtered_alt
+    global throttle_trim
     CMDS = {
         'roll': 1500,
         'pitch': 1500,
@@ -96,35 +89,11 @@ def joy_controller(screen):
                 return 1
 
             board.INAV = getattr(board, 'INAV', False)
-
             screen.addstr(15, 0, f"Connected to FC on {SERIAL_PORT}")
             screen.clrtoeol()
             screen.move(1, 0)
 
             average_cycle = deque([0]*NO_OF_CYCLES_AVERAGE_GUI_TIME)
-            command_list = [
-                'MSP_API_VERSION', 'MSP_FC_VARIANT', 'MSP_FC_VERSION', 'MSP_BUILD_INFO',
-                'MSP_BOARD_INFO', 'MSP_UID', 'MSP_ACC_TRIM', 'MSP_NAME',
-                'MSP_STATUS', 'MSP_STATUS_EX', 'MSP_BATTERY_CONFIG',
-                'MSP_BATTERY_STATE', 'MSP_BOXNAMES'
-            ]
-            if board.INAV:
-                command_list += ['MSPV2_INAV_ANALOG', 'MSP_VOLTAGE_METER_CONFIG']
-
-            for msg in command_list:
-                if board.send_RAW_msg(MSPy.MSPCodes[msg], data=[]):
-                    dataHandler = board.receive_msg()
-                    board.process_recv_data(dataHandler)
-
-            cellCount = board.BATTERY_STATE.get('cellCount', 3)
-            min_voltage = board.BATTERY_CONFIG.get('vbatmincellvoltage', 3.5) * cellCount
-            warn_voltage = board.BATTERY_CONFIG.get('vbatwarningcellvoltage', 3.6) * cellCount
-            max_voltage = board.BATTERY_CONFIG.get('vbatmaxcellvoltage', 4.4) * cellCount
-
-            slow_msgs = cycle(['MSP_ANALOG', 'MSP_STATUS_EX', 'MSP_MOTOR', 'MSP_RC'])
-            cursor_msg = ""
-            last_loop_time = last_slow_msg_time = last_cycleTime = time.time()
-
             screen.addstr(2, 0, f"Joystick: {joy.get_name()}")
             time.sleep(0.2)
             update()
@@ -141,118 +110,47 @@ def joy_controller(screen):
                     CMDS['aux2'] = 1800
                     continue
 
+                # Adjust throttle using buttons
+                if len(button) > 7 and button[7]:  # R2 held
+                    throttle_trim = min(1200, throttle_trim + 5)
+                elif len(button) > 6 and button[6]:  # L2 held
+                    throttle_trim = max(0, throttle_trim - 5)
+
+                CMDS['throttle'] = 900 + throttle_trim
+
                 def scale_axis(val): return int(1500 + max(-200, min(200, int(val * 200))))
-                def scale_throttle(val): return int(1200 + max(-290, min(500, int(val * 500))))
 
-                raw_throttle = scale_throttle(-axis[1])
-                raw_yaw = 1500
-                raw_roll = scale_axis(axis[3])
-                raw_pitch = scale_axis(-axis[4])
-                if alt_hold:
-                    board.fast_read_altitude()
-                    alt = board.SENSOR_DATA['altitude']
-                    filtered_alt = ALT_FILTER_ALPHA * alt + (1 - ALT_FILTER_ALPHA) * filtered_alt
-                    eh = alt_setpoint - filtered_alt
-                    ei += eh * CTRL_LOOP_TIME
-                    throttle_cmd = HOVER_THROTTLE + Kp * eh + Ki * ei
-                    CMDS['throttle'] = max(900, min(1600, int(throttle_cmd)))
-                else:
-                    CMDS['throttle'] = raw_throttle
+                CMDS['roll'] = scale_axis(axis[3])
+                CMDS['pitch'] = scale_axis(-axis[4])
+                CMDS['yaw'] = scale_axis(axis[0])
 
-                
-                CMDS['roll'] = raw_roll
-                CMDS['pitch'] = raw_pitch
-                yaw_base = 1500
-                yaw_step = 150  # You can tune this value
-
-                if len(button) > 4 and button[4]:  # L1
-                    CMDS['yaw'] = max(1100, yaw_base - yaw_step)
-                elif len(button) > 5 and button[5]:  # R1
-                    CMDS['yaw'] = min(1900, yaw_base + yaw_step)
-                else:
-                    CMDS['yaw'] = yaw_base
-                if len(button) > 6 and button[6]:
+                # Arm/disarm/mode buttons
+                if len(button) > 0 and button[0]:
+                    CMDS['aux1'] = 1800
+                elif len(button) > 1 and button[1]:
+                    CMDS['aux1'] = 1000
+                elif len(button) > 3 and button[3]:
+                    CMDS['aux2'] = (CMDS['aux2'] + 500) % 2000
+                elif len(button) > 2 and button[2]:
+                    CMDS['aux2'] = 1800
+                elif len(button) > 9 and button[9]:
                     board.reboot()
                     time.sleep(0.2)
                     break
-                elif len(button) > 0 and button[0]:
-                    cursor_msg = 'Sending Arm command...'
-                    CMDS['aux1'] = 1800
-                elif len(button) > 1 and button[1]:
-                    cursor_msg = 'Sending Disarm command...'
-                    CMDS['aux1'] = 1000
 
-                elif len(button) > 2 and button[2]:
-                    CMDS['aux2'] = 1800
-                    cursor_msg = "FAILSAFE"
-                elif len(button) > 7 and button[7]:
-                    now = time.time()
-                    if now - last_alt_toggle_time > DEBOUNCE_TIME:
-                        last_alt_toggle_time = now
-                        board.fast_read_altitude()
-                        alt_setpoint = board.SENSOR_DATA['altitude']
-                        filtered_alt = alt_setpoint
-                        ei = 0
-                        alt_hold = not alt_hold
-                        cursor_msg = f"Altitude Hold {'ON' if alt_hold else 'OFF'}       "
-                if (time.time() - last_loop_time) >= CTRL_LOOP_TIME:
-                    last_loop_time = time.time()
-                    if board.send_RAW_RC([CMDS[ki] for ki in CMDS_ORDER]):
-                        dataHandler = board.receive_msg()
-                        board.process_recv_data(dataHandler)
+                # Send RC command
+                if board.send_RAW_RC([CMDS[k] for k in CMDS_ORDER]):
+                    dataHandler = board.receive_msg()
+                    board.process_recv_data(dataHandler)
 
-                if (time.time() - last_slow_msg_time) >= SLOW_MSGS_LOOP_TIME:
-                    last_slow_msg_time = time.time()
-                    next_msg = next(slow_msgs)
-                    if board.send_RAW_msg(MSPy.MSPCodes[next_msg], data=[]):
-                        dataHandler = board.receive_msg()
-                        board.process_recv_data(dataHandler)
-
-                    if next_msg == 'MSP_ANALOG':
-                        voltage = board.ANALOG.get('voltage', 0.0)
-                        voltage_msg = ""
-                        if min_voltage < voltage <= warn_voltage:
-                            voltage_msg = "LOW BATT WARNING"
-                        elif voltage <= min_voltage:
-                            voltage_msg = "ULTRA LOW BATT!!!"
-                        elif voltage >= max_voltage:
-                            voltage_msg = "VOLTAGE TOO HIGH"
-                        screen.addstr(8, 0, f"Battery Voltage: {voltage:.2f}V")
-                        screen.addstr(8, 24, voltage_msg, curses.A_BOLD + curses.A_BLINK)
-                        screen.clrtoeol()
-
-                    elif next_msg == 'MSP_STATUS_EX':
-                        mode_flags = board.CONFIG.get('mode', 0)
-                        ARMED = board.bit_check(mode_flags, 0)
-                        RXLOSS = board.bit_check(mode_flags, 1)
-                        screen.addstr(5, 0, f"ARMED: {ARMED}")
-                        screen.addstr(5, 20, f"RXLOSS: {'YES' if RXLOSS else 'NO'}", curses.A_BOLD | (curses.A_BLINK if RXLOSS else 0))
-                        screen.addstr(5, 50, f"Arming Flags: {board.process_armingDisableFlags(board.CONFIG.get('armingDisableFlags', 0))}                         ")
-                        screen.addstr(6, 0, f"CPU Load: {board.CONFIG.get('cpuload', 0)}")
-                        screen.addstr(6, 50, f"Cycle Time: {board.CONFIG.get('cycleTime', 0)}")
-                        screen.addstr(7, 0, f"Mode: {board.CONFIG.get('mode', 0)}")
-                        screen.addstr(7, 50, f"Flight Mode: {board.process_mode(mode_flags)}")
-
-                    elif next_msg == 'MSP_MOTOR':
-                        screen.addstr(9, 0, f"Motor Values: {board.MOTOR_DATA}")
-                        screen.clrtoeol()
-                    elif next_msg == 'MSP_RC':
-                        screen.addstr(10, 0, f"RC Channels: {board.RC.get('channels', [])}")
-                        screen.clrtoeol()
-
-                    avg_cycle_time = sum(average_cycle) / len(average_cycle)
-                    avg_hz = 1 / avg_cycle_time if avg_cycle_time > 0 else 0
-                    screen.addstr(11, 0, f"GUI Cycle Time: {last_cycleTime * 1000:.2f}ms (avg {avg_hz:.2f}Hz)")
-                    screen.addstr(3, 0, cursor_msg)
-                    screen.addstr(12, 0, f"Altitude: {alt:.2f} m | Filtered: {filtered_alt:.2f} m      ")
-                    screen.addstr(13, 0, f"Setpoint: {alt_setpoint:.2f} m | Error: {eh:.2f}            ")
-                    screen.clrtoeol()
+                screen.addstr(5, 0, f"Throttle: {CMDS['throttle']} ")
+                screen.clrtoeol()
 
                 end_time = time.time()
-                last_cycleTime = end_time - start_time
-                if last_cycleTime < CTRL_LOOP_TIME:
-                    time.sleep(CTRL_LOOP_TIME - last_cycleTime)
-                average_cycle.append(last_cycleTime)
+                cycle_time = end_time - start_time
+                if cycle_time < CTRL_LOOP_TIME:
+                    time.sleep(CTRL_LOOP_TIME - cycle_time)
+                average_cycle.append(cycle_time)
                 average_cycle.popleft()
 
     finally:

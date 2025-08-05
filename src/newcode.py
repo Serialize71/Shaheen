@@ -7,6 +7,7 @@ import os
 import pygame
 from yamspy import MSPy
 from pygame.locals import MOUSEMOTION, MOUSEBUTTONUP, MOUSEBUTTONDOWN
+import RPi.GPIO as GPIO
 
 CTRL_LOOP_TIME = 1 / 100
 SLOW_MSGS_LOOP_TIME = 1 / 5
@@ -24,6 +25,9 @@ DEBOUNCE_TIME = 0.5
 ALT_FILTER_ALPHA = 0.01
 filtered_alt = 0
 yaw_trim = 0  
+PIN = 23
+state23 = False  # <-- add this line
+
 
 pygame.init()
 pygame.event.set_blocked((MOUSEMOTION, MOUSEBUTTONUP, MOUSEBUTTONDOWN))
@@ -86,6 +90,8 @@ def run_curses(external_function):
 
 def joy_controller(screen):
     global alt_hold, alt_setpoint, alt, eh, last_alt_toggle_time, filtered_alt, yaw_trim
+    global state23 
+
     CMDS = {
         'roll': 1500,
         'pitch': 1500,
@@ -164,9 +170,9 @@ def joy_controller(screen):
                 def scale_throttle(val):
                     val = max(-1.0, min(1.0, val))  # Clamp input
                     if val >= 0:
-                        return int(1650 + val * (1800 - 1650))  # Forward
+                        return int(1600 + val * (1800 - 1600))  # Forward
                     else:
-                        return int(1650 + val * (1650 - 950))   # Reverse
+                        return int(1600 + val * (1600 - 950))   # Reverse
 
                 raw_throttle = scale_throttle(-axis[1])
                 raw_roll = scale_axis(axis[3])
@@ -202,12 +208,10 @@ def joy_controller(screen):
                     cursor_msg = 'Sending Disarm command...'
                     CMDS['aux1'] = 1000
                 elif len(button) > 3 and button[3]:
-                    if CMDS['aux2'] <= 1300:
-                        CMDS['aux2'] = 1500; cursor_msg = "Horizon"
-                    elif 1300 < CMDS['aux2'] < 1700:
-                        CMDS['aux2'] = 2000; cursor_msg = "Failsafe"
-                    elif CMDS['aux2'] >= 1700:
-                        CMDS['aux2'] = 1000; cursor_msg = "Angle"
+                   state23 = not state23 
+                   GPIO.output(PIN, GPIO.HIGH if state23 else GPIO.LOW)
+                   print("pressed")
+                   time.sleep(0.2)
                 elif len(button) > 2 and button[2]:
                     CMDS['aux2'] = 1800
                     cursor_msg = "FAILSAFE"
@@ -285,8 +289,13 @@ def joy_controller(screen):
 
     finally:
         screen.addstr(5, 0, "Disconnected from FC. Failsafe triggered.")
+        GPIO.output(PIN, GPIO.LOW)
+        GPIO.cleanup()
         screen.clrtoeol()
 
 
 if __name__ == "__main__":
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(PIN, GPIO.OUT)
+    GPIO.output(PIN, GPIO.LOW)
     run_curses(joy_controller)

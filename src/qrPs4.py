@@ -26,7 +26,7 @@ def main():
             break
         
         photo = cv2.cvtColor(photo , cv2.COLOR_RGB2GRAY)
-        frame = cv2.resize(photo , (320, 240))
+        frame = cv2.resize(photo , (480, 360))
 
         # Find and decode QR codes
         decoded_objects = pyzbar.decode(frame)
